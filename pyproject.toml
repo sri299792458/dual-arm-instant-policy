@@ -1,0 +1,35 @@
+[project]
+name = "dual-arm-instant-policy"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "diffusers>=0.34.0",
+    "ip",
+    "ipykernel>=6.29.5",
+    "lightning>=2.5.2",
+    "natsort>=8.4.0",
+    "numpy<2.0.0",
+    "open3d>=0.19.0",
+    "pyrep",
+    "rlbench",
+    "torch==2.2.0",
+    "torch-geometric>=2.6.1",
+    "wandb>=0.21.0",
+    "yarr",
+]
+
+[tool.uv.sources]
+ip = { path = "external/instant_policy" }
+pyrep = { path = "external/pyrep" }
+rlbench = { path = "external/rlbench" }
+yarr = { path = "external/yarr" }
+
+[tool.setuptools]
+packages = ["data_generation"]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

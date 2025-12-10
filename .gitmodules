@@ -1,0 +1,12 @@
+[submodule "external/instant_policy"]
+	path = external/instant_policy
+	url = https://github.com/mohitydv09/instant_policy
+[submodule "external/pyrep"]
+	path = external/pyrep
+	url = https://github.com/mohitydv09/PyRep
+[submodule "external/rlbench"]
+	path = external/rlbench
+	url = https://github.com/mohitydv09/RLBench
+[submodule "external/yarr"]
+	path = external/yarr
+	url = https://github.com/mohitydv09/YARR

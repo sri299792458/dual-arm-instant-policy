@@ -1,0 +1,12 @@
+*__pycache__
+
+MUJOCO_LOG.TXT
+
+.venv
+.vscode
+dual_arm_instant_policy.egg-info
+src/data
+src/fake_data_ip
+src/fake_data
+src/testing.ipynb
+src/checkpoints

@@ -1,0 +1,1 @@
+uv pip install torch-cluster -f https://data.pyg.org/whl/torch-2.2.0+cu121.html --no-build dependencies
