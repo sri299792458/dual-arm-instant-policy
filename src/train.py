@@ -29,6 +29,8 @@ def main():
     config['save_dir'] = save_dir
     config['record'] = record
     model = GraphDiffusionBimanual(config).to(config['device'])
+    if config.get('compile_models', False):
+        model.model.compile_models()
 
     dset_val = RunningDatasetBimanual(data_path_val, len(os.listdir(data_path_val)), rand_g_prob=0)
     dataloader_val = DataLoader(dset_val, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)

@@ -5,6 +5,49 @@ from torch_geometric.data import HeteroData
 from ip.utils.common_utils import printarr, PositionalEncoder, SinusoidalPosEmb
 
 
+class FastPositionalEncoder(nn.Module):
+    """Vectorized Fourier encoding - much faster!"""
+    def __init__(self, d_input, num_freqs, log_space=True, add_original_x=True, scale=1.0):
+        super().__init__()
+        self.add_original_x = add_original_x
+        self.scale = scale
+        if log_space:
+            freq_bands = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs)
+        else:
+            freq_bands = torch.linspace(1, 2 ** (num_freqs - 1), num_freqs)
+        
+        # Precompute: [num_freqs, 1]
+        self.register_buffer('freq_bands', freq_bands.unsqueeze(1))
+        
+        # Output dim: original (if added) + sin + cos
+        self.d_output = d_input * (2 * num_freqs + (1 if add_original_x else 0))
+    
+    def forward(self, x):
+        # x: [..., d_input]
+        # [..., d_input, 1] * [1, 1, num_freqs] -> [..., d_input, num_freqs]
+        x_freq = x.unsqueeze(-1) * self.freq_bands.T * torch.pi * self.scale
+        
+        # Compute sin and cos in one go
+        sin_feat = torch.sin(x_freq)  # [..., d_input, num_freqs]
+        cos_feat = torch.cos(x_freq)  # [..., d_input, num_freqs]
+        
+        # Flatten the frequency dimension
+        # The original PositionalEncoder likely flattens as [sin_freq1, sin_freq2, ..., cos_freq1, ...]
+        # My implementation: x, sin_flat, cos_flat
+        
+        if self.add_original_x:
+            return torch.cat([
+                x,
+                sin_feat.flatten(-2),
+                cos_feat.flatten(-2)
+            ], dim=-1)
+        else:
+             return torch.cat([
+                sin_feat.flatten(-2),
+                cos_feat.flatten(-2)
+            ], dim=-1)
+
+
 class BimanualGraphRep(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -37,7 +80,8 @@ class BimanualGraphRep(nn.Module):
         #############################################
         self.sine_pose_embd = SinusoidalPosEmb(self.d_time_dim) ## 64
         ## Learable embeddings
-        self.pos_embd = PositionalEncoder(3, self.num_freqs, log_space=True, add_original_x=True, scale=1.0) ## N, 63 as input 3, for each input sin and cos and 10 freq
+        ## Learable embeddings
+        self.pos_embd = FastPositionalEncoder(3, self.num_freqs, log_space=True, add_original_x=True, scale=1.0) ## N, 63 as input 3, for each input sin and cos and 10 freq
         self.edge_dim = self.pos_embd.d_output * 2 ## d_output = 63, * 2 = 126
         self.gripper_left_proj = nn.Linear(1, self.g_state_dim) ## gripper open close state, 1 dim to 64 dim
         self.gripper_right_proj = nn.Linear(1, self.g_state_dim)
@@ -92,6 +136,7 @@ class BimanualGraphRep(nn.Module):
             ('gripper_right', 'demo_action', 'gripper_right'), ## Demo gripper to current gripper
         ]
         self.graph = None
+        self._last_config = None
 
     def create_dense_edge_idx(self, num_nodes_source, num_nodes_dest):
         return torch.cartesian_prod(
@@ -265,6 +310,13 @@ class BimanualGraphRep(nn.Module):
         }
 
     def initialise_graph(self):
+        # Check if we can skip initialization
+        current_config = (self.batch_size, self.num_demos)
+        if self.graph is not None and getattr(self, '_last_config', None) == current_config:
+            return
+
+        self._last_config = current_config
+
         # Manually connecting different nodes in the graph to achieve our desired graph representation.
         # Probably could be re-written to be more beautiful. Most definitely could.
         ## Extend to bimanual
@@ -455,13 +507,23 @@ class BimanualGraphRep(nn.Module):
         self.graph[('scene', 'rel_demo', 'scene')].edge_index = dense_s_s[:, s_rel_s_mask_demo]
         self.graph[('gripper_left', 'rel_cond', 'gripper_left')].edge_index = dense_gl_gl[:, gl_tc_gl]
         self.graph[('gripper_right', 'rel_cond', 'gripper_right')].edge_index = dense_gr_gr[:, gr_tc_gr]
+        
+        # Pre-allocate buffers for update_graph
+        self._cached_gripper_node_pos = self.gripper_node_pos[None, None, None, :, :].repeat(
+            self.batch_size, self.num_demos, self.traj_horizon, 1, 1)
+        self._cached_gripper_node_pos_current = self.gripper_node_pos[None, None, None, :, :].repeat(
+            self.batch_size, 1, 1, 1, 1)
+        self._cached_gripper_node_pos_action = self.gripper_node_pos[None, None, :, :].repeat(
+            self.batch_size, 1, self.pred_horizon, 1, 1)
 
     """ Below will need some understanding of data processing the train function I guess. """
     def update_graph(self, data):
         # Adding information to the graph structure create in initialise_graph.
         # scene_node_pos: # [B, N, T, S, 3]
-        gripper_node_pos = self.gripper_node_pos[None, None, None, :, :].repeat(
-            self.batch_size, self.num_demos, self.traj_horizon, 1, 1,)
+        
+        # Use pre-allocated buffers
+        gripper_node_pos = self._cached_gripper_node_pos
+        ########################################################################
         ########################################################################
         # demo_T_w_es: [B, D, T, 4, 4]
         # T_w_e: [B, 4, 4]
@@ -484,10 +546,10 @@ class BimanualGraphRep(nn.Module):
         # all_T_e_w_left = all_T_w_e_left.inverse()
         # all_T_right_left_e = all_T_left_right_e.inverse()
         # ################################################################################
-        gripper_node_pos_current = self.gripper_node_pos[None, None, None, :, :].repeat(
-            self.batch_size, 1, 1, 1, 1)
-        gripper_node_pos_action = self.gripper_node_pos[None, None, :, :].repeat(
-            self.batch_size, 1, self.pred_horizon, 1, 1)
+        # all_T_right_left_e = all_T_left_right_e.inverse()
+        # ################################################################################
+        gripper_node_pos_current = self._cached_gripper_node_pos_current
+        gripper_node_pos_action = self._cached_gripper_node_pos_action
         
         # for k, v in data.items():
         #     print(f"{k}: {v.shape}") if isinstance(v, torch.Tensor) else None

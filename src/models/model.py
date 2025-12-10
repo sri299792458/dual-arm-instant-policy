@@ -161,7 +161,10 @@ class BimanualAGI(torch.nn.Module):
         self.graph.initialise_graph()
 
     def compile_models(self):
-        raise NotImplementedError("Compile models is not yet implemented in the BimanualAGI code.")
+        print("Compiling models with torch.compile...")
+        self.local_encoder = torch.compile(self.local_encoder)
+        self.cond_encoder = torch.compile(self.cond_encoder)
+        self.action_encoder = torch.compile(self.action_encoder)
 
     def get_labels(self, gt_actions_left, gt_actions_right, noisy_actions_left, noisy_actions_right,
                    gt_grips_left, gt_grips_right, noisy_grips_left, noisy_grips_right,
