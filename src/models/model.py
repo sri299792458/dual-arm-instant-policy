@@ -53,7 +53,7 @@ class BimanualAGI(torch.nn.Module):
             heads=config['hidden_dim'] // 64,
             num_layers=self.num_layers,
             metadata=(
-                ['scene', 'gripper_left', 'gripper_right'],
+                ['scene', 'gripper_left', 'gripper_right', 'task'],
                 [
                     ('scene', 'rel', 'scene'),
                     ('gripper_left', 'rel', 'gripper_left'),
@@ -62,6 +62,11 @@ class BimanualAGI(torch.nn.Module):
                     ('scene', 'rel', 'gripper_right'),
                     ('gripper_left', 'rel', 'gripper_right'),
                     ('gripper_right', 'rel', 'gripper_left'),
+                    ('task', 'rel', 'task'),
+                    ('gripper_left', 'to_task', 'task'),
+                    ('gripper_right', 'to_task', 'task'),
+                    ('task', 'from_task', 'gripper_left'),
+                    ('task', 'from_task', 'gripper_right'),
                 ]
             ),
             edge_dim=self.graph.edge_dim,
@@ -75,7 +80,7 @@ class BimanualAGI(torch.nn.Module):
             heads=config['hidden_dim'] // 64,
             num_layers=self.num_layers,
             metadata=(
-                ['scene', 'gripper_left', 'gripper_right'],
+                ['scene', 'gripper_left', 'gripper_right', 'task'],
                 [
                     ('gripper_left', 'cond', 'gripper_left'),
                     ('gripper_right', 'cond', 'gripper_right'),
@@ -84,6 +89,7 @@ class BimanualAGI(torch.nn.Module):
                     ('scene', 'rel_demo', 'gripper_left'),
                     ('scene', 'rel_demo', 'gripper_right'),
                     ('scene', 'rel_demo', 'scene'),
+                    ('task', 'cond', 'task'),
                 ]
             ),
             edge_dim=self.graph.edge_dim,
@@ -97,7 +103,7 @@ class BimanualAGI(torch.nn.Module):
             heads=config['hidden_dim'] // 64,
             num_layers=self.num_layers,
             metadata=(
-                ['scene', 'gripper_left', 'gripper_right'],
+                ['scene', 'gripper_left', 'gripper_right', 'task'],
                 [
                     ('gripper_left', 'time_action', 'gripper_left'),
                     ('gripper_right', 'time_action', 'gripper_right'),
@@ -106,6 +112,7 @@ class BimanualAGI(torch.nn.Module):
                     ('scene', 'rel_action', 'gripper_left'),
                     ('scene', 'rel_action', 'gripper_right'),
                     ('scene', 'rel_action', 'scene'),
+                    ('task', 'time_action', 'task'),
                 ]
             ),
             edge_dim=self.graph.edge_dim,

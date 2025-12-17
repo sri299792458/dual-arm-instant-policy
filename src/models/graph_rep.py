@@ -3,6 +3,7 @@ from torch import nn
 from torch_geometric.data import HeteroData
 
 from ip.utils.common_utils import printarr, PositionalEncoder, SinusoidalPosEmb
+from utils.se3_ops import task_pose_from_grippers, apply_se3
 
 
 class FastPositionalEncoder(nn.Module):
@@ -104,9 +105,25 @@ class BimanualGraphRep(nn.Module):
         self.gripper_da_gripper_embds_left = nn.Embedding(1, self.edge_dim, device=self.device) ## 1, 126
         self.gripper_da_gripper_embds_right = nn.Embedding(1, self.edge_dim, device=self.device)
 
+        # Task-frame keypoint template
+        s = 0.07
+        self.task_kp_template = torch.tensor([
+            [0.0, 0.0, 0.0],    # origin
+            [s, 0.0, 0.0],      # +x (left->right direction)
+            [0.0, s, 0.0],      # +y
+            [0.0, 0.0, s],      # +z
+            [0.0, -s, 0.0],     # -y
+            [0.0, 0.0, -s],     # -z
+        ], dtype=torch.float32, device=self.device)
+        self.num_task_kp = len(self.task_kp_template)
+
+        # Task node embeddings (similar structure to gripper embeddings)
+        self.task_embds = nn.Embedding(self.num_task_kp * self.pred_horizon, self.embd_dim - self.d_time_dim, device=self.device)
+        self.task_proj = nn.Linear(1, self.g_state_dim, device=self.device)  # For coupling indicator
+
         #################################################
         ## Structure of the graph
-        self.node_types = ['scene', 'gripper_left', 'gripper_right']
+        self.node_types = ['scene', 'gripper_left', 'gripper_right', 'task']
         self.edge_types = [
             ########################################
             ### Connect Local Obs
@@ -134,6 +151,16 @@ class BimanualGraphRep(nn.Module):
             ## Gripper in demo to action
             ('gripper_left', 'demo_action', 'gripper_left'), ## Demo gripper to current gripper
             ('gripper_right', 'demo_action', 'gripper_right'), ## Demo gripper to current gripper
+
+            ########################################
+            ### Task-frame edges for coordination
+            ('task', 'rel', 'task'),  # Task nodes to themselves
+            ('gripper_left', 'to_task', 'task'),  # Gripper left aggregates to task
+            ('gripper_right', 'to_task', 'task'),  # Gripper right aggregates to task
+            ('task', 'from_task', 'gripper_left'),  # Task broadcasts to gripper left
+            ('task', 'from_task', 'gripper_right'),  # Task broadcasts to gripper right
+            ('task', 'cond', 'task'),  # Task conditioning
+            ('task', 'time_action', 'task'),  # Task temporal connections
         ]
         self.graph = None
         self._last_config = None
@@ -157,6 +184,21 @@ class BimanualGraphRep(nn.Module):
         if not has_demo:
             gripper_nodes = gripper_nodes.squeeze(1)
         return gripper_nodes
+
+    def transform_task_keypoints(self, T_task):
+        """Transform task keypoints to world frame using task poses
+        T_task: [..., 4, 4] - task frame poses
+        Returns: [..., num_task_kp, 3] - task keypoints in world frame
+        """
+        # Get original shape and flatten
+        orig_shape = T_task.shape[:-2]
+        T_flat = T_task.reshape(-1, 4, 4)
+
+        # Transform template keypoints
+        kp_world = apply_se3(T_flat, self.task_kp_template[None, :, :].expand(T_flat.shape[0], -1, -1))
+
+        # Reshape back
+        return kp_world.view(*orig_shape, self.num_task_kp, 3)
     
     def get_node_info(self):
         # A bunch of arange operations to store information which node in the graph belongs to which batch, timestep etc.
@@ -287,6 +329,39 @@ class BimanualGraphRep(nn.Module):
                                                           device=self.device)
         gripper_right_demo = torch.cat([gripper_right_demo, gripper_right_current], dim=0)
 
+        ################################################################################################################
+        ## Task Nodes (similar to gripper nodes)
+        # [bs, nd, th, task_kp, 3] + [bs, task_kp, 3] + [bs, ph, task_kp, 3]
+        task_batch = sb[:, None, None, None].repeat(1, self.num_demos, self.traj_horizon, self.num_task_kp).view(-1)
+        task_batch_current = sb[:, None].repeat(1, self.num_task_kp).view(-1)
+        task_batch_action = sb[:, None, None].repeat(1, self.pred_horizon, self.num_task_kp).view(-1)
+        task_batch = torch.cat([task_batch, task_batch_current, task_batch_action], dim=0)
+
+        task_time = torch.arange(self.traj_horizon, device=self.device, dtype=torch.long)[None, None, :,
+                    None].repeat(self.batch_size, self.num_demos, 1, self.num_task_kp).view(-1)
+        task_time_current = self.traj_horizon * torch.ones(self.batch_size * self.num_task_kp, device=self.device,
+                                                           dtype=torch.long)
+        task_time_action = torch.arange(self.pred_horizon, device=self.device, dtype=torch.long)[None, :,
+                         None].repeat(self.batch_size, 1, self.num_task_kp).view(-1)
+        task_time = torch.cat([task_time, task_time_current, task_time_action + self.traj_horizon + 1], dim=0)
+
+        task_node = torch.arange(self.num_task_kp, device=self.device)[None, None, None, :].repeat(
+            self.batch_size, self.num_demos, self.traj_horizon, 1).view(-1)
+        task_node_current = torch.arange(self.num_task_kp, device=self.device)[None, :].repeat(
+            self.batch_size, 1).view(-1)
+        task_node_action = torch.arange(self.num_task_kp, device=self.device)[None, None, :].repeat(
+            self.batch_size, self.pred_horizon, 1).view(-1)
+        task_node = torch.cat([task_node, task_node_current, task_node_action], dim=0)
+
+        task_embd = task_node.clone()
+        task_embd[task_time > self.traj_horizon] += self.num_task_kp * task_time_action
+
+        task_demo = torch.arange(self.num_demos, device=self.device)[None, :, None, None].repeat(
+            self.batch_size, 1, self.traj_horizon, self.num_task_kp).view(-1)
+        task_current = self.num_demos * torch.ones(self.batch_size * (self.pred_horizon + 1) * self.num_task_kp,
+                                                 device=self.device)
+        task_demo = torch.cat([task_demo, task_current], dim=0)
+
         return {
             'scene': {
                 'batch': scene_batch,
@@ -306,6 +381,13 @@ class BimanualGraphRep(nn.Module):
                 'node': gripper_right_node,
                 'embd': gripper_right_embd,
                 'demo': gripper_right_demo,
+            },
+            'task': {
+                'batch': task_batch,
+                'time': task_time,
+                'node': task_node,
+                'embd': task_embd,
+                'demo': task_demo,
             }
         }
 
@@ -340,7 +422,19 @@ class BimanualGraphRep(nn.Module):
                                                 node_info['gripper_left']['embd'].shape[0])
         dense_s_gr = self.create_dense_edge_idx(node_info['scene']['batch'].shape[0],
                                                 node_info['gripper_right']['embd'].shape[0])
-        
+
+        ## Task nodes
+        dense_t_t = self.create_dense_edge_idx(node_info['task']['embd'].shape[0],
+                                                node_info['task']['embd'].shape[0])
+        dense_gl_t = self.create_dense_edge_idx(node_info['gripper_left']['embd'].shape[0],
+                                                 node_info['task']['embd'].shape[0])
+        dense_gr_t = self.create_dense_edge_idx(node_info['gripper_right']['embd'].shape[0],
+                                                 node_info['task']['embd'].shape[0])
+        dense_t_gl = self.create_dense_edge_idx(node_info['task']['embd'].shape[0],
+                                                 node_info['gripper_left']['embd'].shape[0])
+        dense_t_gr = self.create_dense_edge_idx(node_info['task']['embd'].shape[0],
+                                                 node_info['gripper_right']['embd'].shape[0])
+
         ################################################################################################################
         ## Scene to Scene Mask
         s_rel_s_mask = node_info['scene']['batch'][dense_s_s[0, :]] == node_info['scene']['batch'][dense_s_s[1, :]]
@@ -463,6 +557,43 @@ class BimanualGraphRep(nn.Module):
         gr_d_gr_mask = gr_d_gr_mask & (node_info['gripper_right']['time'][dense_gr_gr[1, :]] - node_info['gripper_right']['time'][
             dense_gr_gr[0, :]] == -1)
         ################################################################################################################
+        ## Task Node Masks
+        # Task to task local (same batch, time, demo)
+        t_rel_t_mask = node_info['task']['batch'][dense_t_t[0, :]] == node_info['task']['batch'][dense_t_t[1, :]]
+        t_rel_t_mask = t_rel_t_mask & (node_info['task']['time'][dense_t_t[0, :]] == node_info['task']['time'][dense_t_t[1, :]])
+        t_rel_t_mask = t_rel_t_mask & (node_info['task']['demo'][dense_t_t[0, :]] == node_info['task']['demo'][dense_t_t[1, :]])
+
+        # Gripper left to task (same batch, time, demo)
+        gl_to_t_mask = node_info['gripper_left']['batch'][dense_gl_t[0, :]] == node_info['task']['batch'][dense_gl_t[1, :]]
+        gl_to_t_mask = gl_to_t_mask & (node_info['gripper_left']['time'][dense_gl_t[0, :]] == node_info['task']['time'][dense_gl_t[1, :]])
+        gl_to_t_mask = gl_to_t_mask & (node_info['gripper_left']['demo'][dense_gl_t[0, :]] == node_info['task']['demo'][dense_gl_t[1, :]])
+
+        # Gripper right to task (same batch, time, demo)
+        gr_to_t_mask = node_info['gripper_right']['batch'][dense_gr_t[0, :]] == node_info['task']['batch'][dense_gr_t[1, :]]
+        gr_to_t_mask = gr_to_t_mask & (node_info['gripper_right']['time'][dense_gr_t[0, :]] == node_info['task']['time'][dense_gr_t[1, :]])
+        gr_to_t_mask = gr_to_t_mask & (node_info['gripper_right']['demo'][dense_gr_t[0, :]] == node_info['task']['demo'][dense_gr_t[1, :]])
+
+        # Task to gripper left (same batch, time, demo)
+        t_to_gl_mask = node_info['task']['batch'][dense_t_gl[0, :]] == node_info['gripper_left']['batch'][dense_t_gl[1, :]]
+        t_to_gl_mask = t_to_gl_mask & (node_info['task']['time'][dense_t_gl[0, :]] == node_info['gripper_left']['time'][dense_t_gl[1, :]])
+        t_to_gl_mask = t_to_gl_mask & (node_info['task']['demo'][dense_t_gl[0, :]] == node_info['gripper_left']['demo'][dense_t_gl[1, :]])
+
+        # Task to gripper right (same batch, time, demo)
+        t_to_gr_mask = node_info['task']['batch'][dense_t_gr[0, :]] == node_info['gripper_right']['batch'][dense_t_gr[1, :]]
+        t_to_gr_mask = t_to_gr_mask & (node_info['task']['time'][dense_t_gr[0, :]] == node_info['gripper_right']['time'][dense_t_gr[1, :]])
+        t_to_gr_mask = t_to_gr_mask & (node_info['task']['demo'][dense_t_gr[0, :]] == node_info['gripper_right']['demo'][dense_t_gr[1, :]])
+
+        # Task conditioning (demo to current)
+        t_c_t_mask = node_info['task']['batch'][dense_t_t[0, :]] == node_info['task']['batch'][dense_t_t[1, :]]
+        t_c_t_mask = t_c_t_mask & (node_info['task']['time'][dense_t_t[0, :]] < self.traj_horizon)
+        t_c_t_mask = t_c_t_mask & (node_info['task']['time'][dense_t_t[1, :]] == self.traj_horizon)
+
+        # Task temporal (action timesteps)
+        t_t_t_mask = node_info['task']['batch'][dense_t_t[0, :]] == node_info['task']['batch'][dense_t_t[1, :]]
+        t_t_t_mask = t_t_t_mask & (node_info['task']['time'][dense_t_t[0, :]] >= self.traj_horizon)
+        t_t_t_mask = t_t_t_mask & (node_info['task']['time'][dense_t_t[1, :]] > self.traj_horizon)
+        t_t_t_mask = t_t_t_mask & (node_info['task']['time'][dense_t_t[1, :]] != node_info['task']['time'][dense_t_t[0, :]])
+        ################################################################################################################
         ## Set values in graph
         self.graph.gripper_left_batch = node_info['gripper_left']['batch']
         self.graph.gripper_left_time = node_info['gripper_left']['time']
@@ -476,7 +607,12 @@ class BimanualGraphRep(nn.Module):
         self.graph.gripper_right_demo = node_info['gripper_right']['demo']
         self.graph.scene_batch = node_info['scene']['batch']
         self.graph.scene_traj = node_info['scene']['traj']
-        self.graph.scene_demo = node_info['scene']['demo']  
+        self.graph.scene_demo = node_info['scene']['demo']
+        self.graph.task_batch = node_info['task']['batch']
+        self.graph.task_time = node_info['task']['time']
+        self.graph.task_node = node_info['task']['node']
+        self.graph.task_embd = node_info['task']['embd'].long()
+        self.graph.task_demo = node_info['task']['demo']
 
         ## Add edges
         ## Local
@@ -507,7 +643,16 @@ class BimanualGraphRep(nn.Module):
         self.graph[('scene', 'rel_demo', 'scene')].edge_index = dense_s_s[:, s_rel_s_mask_demo]
         self.graph[('gripper_left', 'rel_cond', 'gripper_left')].edge_index = dense_gl_gl[:, gl_tc_gl]
         self.graph[('gripper_right', 'rel_cond', 'gripper_right')].edge_index = dense_gr_gr[:, gr_tc_gr]
-        
+
+        ## Task edges
+        self.graph[('task', 'rel', 'task')].edge_index = dense_t_t[:, t_rel_t_mask]
+        self.graph[('gripper_left', 'to_task', 'task')].edge_index = dense_gl_t[:, gl_to_t_mask]
+        self.graph[('gripper_right', 'to_task', 'task')].edge_index = dense_gr_t[:, gr_to_t_mask]
+        self.graph[('task', 'from_task', 'gripper_left')].edge_index = dense_t_gl[:, t_to_gl_mask]
+        self.graph[('task', 'from_task', 'gripper_right')].edge_index = dense_t_gr[:, t_to_gr_mask]
+        self.graph[('task', 'cond', 'task')].edge_index = dense_t_t[:, t_c_t_mask]
+        self.graph[('task', 'time_action', 'task')].edge_index = dense_t_t[:, t_t_t_mask]
+
         # Pre-allocate buffers for update_graph
         self._cached_gripper_node_pos = self.gripper_node_pos[None, None, None, :, :].repeat(
             self.batch_size, self.num_demos, self.traj_horizon, 1, 1)
@@ -638,6 +783,51 @@ class BimanualGraphRep(nn.Module):
         #########################################
         #########################################
 
+        #########################################
+        ### Task nodes - KEY ADDITION!
+        #########################################
+        # Compute task poses from gripper pairs
+        T_demo_task = task_pose_from_grippers(
+            data.demo_T_w_es_left[:, :self.num_demos],
+            data.demo_T_w_es_right[:, :self.num_demos]
+        )  # (B, D, T, 4, 4)
+
+        T_cur_task = task_pose_from_grippers(
+            data.T_w_es_left,
+            data.T_w_es_right
+        )  # (B, 4, 4)
+
+        T_action_task = task_pose_from_grippers(
+            data.actions_left,
+            data.actions_right
+        )  # (B, P, 4, 4)
+
+        # Transform task keypoints to world frame
+        task_kp_demo = self.transform_task_keypoints(T_demo_task)  # (B, D, T, num_task_kp, 3)
+        task_kp_cur = self.transform_task_keypoints(T_cur_task)  # (B, num_task_kp, 3)
+        task_kp_action = self.transform_task_keypoints(T_action_task)  # (B, P, num_task_kp, 3)
+
+        # Flatten positions
+        task_node_pos = torch.cat([
+            task_kp_demo.reshape(-1, 3),
+            task_kp_cur.reshape(-1, 3),
+            task_kp_action.reshape(-1, 3)
+        ], dim=0)
+
+        # Task node embeddings (similar to gripper embeddings)
+        task_embd = self.task_embds(self.graph.task_embd)
+
+        # Add diffusion timestep to task action nodes
+        d_time_embd_task = self.sine_pose_embd(data.diff_time)[:, None, ...].repeat(
+            1, self.pred_horizon, self.num_task_kp, 1
+        ).view(-1, self.d_time_dim)
+        task_embd[self.graph.task_time > self.traj_horizon][:, -self.d_time_dim:] = d_time_embd_task
+
+        # Coupling indicator (simple version: always 1.0 for now, can be made adaptive)
+        task_states = self.task_proj(torch.ones(task_node_pos.shape[0], 1, device=self.device))
+        task_embd = torch.cat([task_embd, task_states], dim=-1)
+        #########################################
+
         ## Scene node position and embedding
         scene_node_pos = torch.cat([
             data.demo_scene_node_pos[:, :self.num_demos].reshape(-1, 3),
@@ -656,6 +846,8 @@ class BimanualGraphRep(nn.Module):
         self.graph['gripper_right'].x = gripper_right_embd
         self.graph['scene'].pos = scene_node_pos
         self.graph['scene'].x = scene_node_embd
+        self.graph['task'].pos = task_node_pos
+        self.graph['task'].x = task_embd
 
         if self.pos_in_nodes:
             self.graph['gripper_left'].x = \
@@ -664,6 +856,8 @@ class BimanualGraphRep(nn.Module):
                 torch.cat([self.graph['gripper_right'].x, self.pos_embd(self.graph['gripper_right'].pos)], dim=-1)
             self.graph['scene'].x = \
                 torch.cat([self.graph['scene'].x, self.pos_embd(self.graph['scene'].pos)], dim=-1)
+            self.graph['task'].x = \
+                torch.cat([self.graph['task'].x, self.pos_embd(self.graph['task'].pos)], dim=-1)
 
         ## Add relative edge attributes for gripper nodes.
         self.add_rel_edge_attr('scene', 'scene')
@@ -699,6 +893,15 @@ class BimanualGraphRep(nn.Module):
         self.add_rel_edge_attr('gripper_right', 'gripper_right', edge='time_action')
         self.add_rel_edge_attr('gripper_right', 'gripper_right', edge='rel_cond')
         self.add_rel_edge_attr('gripper_right', 'gripper_right', edge='demo')
+
+        ## Task edge attributes
+        self.add_rel_edge_attr('task', 'task')
+        self.add_rel_edge_attr('gripper_left', 'task', edge='to_task')
+        self.add_rel_edge_attr('gripper_right', 'task', edge='to_task')
+        self.add_rel_edge_attr('task', 'gripper_left', edge='from_task')
+        self.add_rel_edge_attr('task', 'gripper_right', edge='from_task')
+        self.add_rel_edge_attr('task', 'task', edge='cond')
+        self.add_rel_edge_attr('task', 'task', edge='time_action')
 
         # self.add_rel_edge_attr('gripper_left', 'gripper_left', edge='time_action',
         #                        all_T_w_e = all_T_w_e_left, all_T_e_w = all_T_e_w_left)

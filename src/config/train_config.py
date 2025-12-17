@@ -25,6 +25,11 @@ config = {
     'pos_in_nodes': True,
     'num_layers': 2,
 
+    # Task-frame config (NEW - for bimanual coordination)
+    'num_task_kp': 6,
+    'num_gripper_kp': 6,
+    'parameterization': 'task_residual',  # 'task_residual' or 'absolute'
+
     'num_epochs': 100,
 
     # Diffusion config
