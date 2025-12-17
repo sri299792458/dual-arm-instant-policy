@@ -10,3 +10,4 @@ src/fake_data_ip
 src/fake_data
 src/testing.ipynb
 src/checkpoints
+external/

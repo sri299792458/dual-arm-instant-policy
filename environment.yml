@@ -1,0 +1,22 @@
+name: dual-arm-ip
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+    - torchvision --index-url https://download.pytorch.org/whl/cu121
+    - torch-geometric>=2.6.1
+    - lightning>=2.5.2
+    - wandb
+    - diffusers>=0.34.0
+    - open3d>=0.18.0
+    - numpy<2.0.0
+    - scipy
+    - matplotlib
+    - tqdm
+    - ipykernel
+    - natsort
