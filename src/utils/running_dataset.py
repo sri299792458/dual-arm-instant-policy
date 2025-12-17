@@ -43,7 +43,7 @@ class RunningDatasetBimanual(Dataset):
             self.data_cache = {}
             for i in tqdm(range(num_samples), desc="Preloading data"):
                 try:
-                    self.data_cache[i] = torch.load(os.path.join(data_path, f"data_{i}.pt"))
+                    self.data_cache[i] = torch.load(os.path.join(data_path, f"data_{i}.pt"), map_location='cpu')
                 except FileNotFoundError:
                     # In case data generation is incomplete or sparse
                     pass
@@ -75,7 +75,7 @@ class RunningDatasetBimanual(Dataset):
                     import copy
                     data = copy.deepcopy(self.data_cache[idx])
                 else:
-                    data = torch.load(os.path.join(self.data_path, f"data_{idx}.pt"))
+                    data = torch.load(os.path.join(self.data_path, f"data_{idx}.pt"), map_location='cpu')
                 ## Make sure the data has all the required attributes
                 ## I don't know what does this mean or how is this used.
                 for attr in self.data_attr:

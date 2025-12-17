@@ -242,8 +242,8 @@ class BimanualAGI(torch.nn.Module):
         ## below two lines are not supposed to run ever in our code. For now.
         if not hasattr(data, 'demo_scene_node_embds'):
             data.demo_scene_node_embds, data.demo_scene_node_pos = self.get_demo_scene_emb(data)
-        if not hasattr(data, 'current_scene_node_embds'):
-            data.current_scene_node_embds, data.current_scene_node_pos = self.get_live_scene_emb(data)
+        if not hasattr(data, 'live_scene_node_embds'):
+            data.live_scene_node_embds, data.live_scene_node_pos = self.get_live_scene_emb(data)
         
         ## Copy the current observation to the future observations.
         ## As we have the obs in the world frame, we don't need to do this.
@@ -278,10 +278,10 @@ class BimanualAGI(torch.nn.Module):
         # data.pos_obs = pos_obs_old
         # data.batch_pos_obs = batch_pos_obs_old
 
-        data.action_scene_node_embds = data.current_scene_node_embds[:, None, :, :].repeat(
+        data.action_scene_node_embds = data.live_scene_node_embds[:, None, :, :].repeat(
             1, self.pred_horizon, 1, 1
         )
-        data.action_scene_node_pos = data.current_scene_node_pos[:, None, :, :].repeat(
+        data.action_scene_node_pos = data.live_scene_node_pos[:, None, :, :].repeat(
             1, self.pred_horizon, 1, 1
         )
 

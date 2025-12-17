@@ -15,16 +15,19 @@ from config.train_config import config
 # Set device to cpu if cuda not available, or respect config
 device = config['device'] if torch.cuda.is_available() else 'cpu'
 config['device'] = device
+config['pre_trained_encoder'] = False # Disable for profiling
 print(f"Using device: {device}")
 
 def profile_training_step(data_path, num_samples):
     # Setup
     print("Initializing model...")
     model = GraphDiffusionBimanual(config).to(device)
+    if config.get('compile_models', False):
+         model.model.compile_models()
     model.train()
     
     print(f"Loading dataset from {data_path}...")
-    dset = RunningDatasetBimanual(data_path, num_samples)
+    dset = RunningDatasetBimanual(data_path, num_samples, preload=False)
     loader = DataLoader(dset, batch_size=config['batch_size'], shuffle=True)
     
     print("Getting batch...")
@@ -37,7 +40,8 @@ def profile_training_step(data_path, num_samples):
     # Warmup
     print("Warming up...")
     for _ in range(3):
-        loss = model.training_step(data, 0)
+        batch = data.clone()
+        loss = model.training_step(batch, 0)
         loss.backward()
     
     torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -51,7 +55,8 @@ def profile_training_step(data_path, num_samples):
         with_stack=True
     ) as prof:
         with record_function("training_step"):
-            loss = model.training_step(data, 0)
+            batch = data.clone()
+            loss = model.training_step(batch, 0)
         
         with record_function("backward"):
             loss.backward()
@@ -73,7 +78,7 @@ def manual_timing(data_path, num_samples):
     model = GraphDiffusionBimanual(config).to(device)
     model.train()
     
-    dset = RunningDatasetBimanual(data_path, num_samples)
+    dset = RunningDatasetBimanual(data_path, num_samples, preload=False)
     loader = DataLoader(dset, batch_size=config['batch_size'], shuffle=True)
     
     try:
@@ -129,9 +134,10 @@ def manual_timing(data_path, num_samples):
     
     # Get embeddings first
     if not hasattr(data, 'demo_scene_node_embds'):
-        time_fn("get_demo_scene_emb", model.model.get_demo_scene_emb, data)
+        data.demo_scene_node_embds, data.demo_scene_node_pos = time_fn("get_demo_scene_emb", model.model.get_demo_scene_emb, data)
     if not hasattr(data, 'live_scene_node_embds'):
-        time_fn("get_live_scene_emb", model.model.get_live_scene_emb, data)
+        # Fix: Assing to data object using 'live_' prefix as expected by graph_rep
+        data.live_scene_node_embds, data.live_scene_node_pos = time_fn("get_live_scene_emb", model.model.get_live_scene_emb, data)
     
     data.action_scene_node_embds = data.live_scene_node_embds[:, None, :, :].repeat(
         1, config['pred_horizon'], 1, 1)
@@ -140,6 +146,12 @@ def manual_timing(data_path, num_samples):
     
     # Time graph construction
     time_fn("update_graph", model.model.graph.update_graph, data)
+    
+    # Analyze graph statistics
+    graph = model.model.graph.graph
+    print(f"\n[Graph Stats] Total edges: {graph.num_edges}")
+    for edge_type, edge_index in graph.edge_index_dict.items():
+        print(f"  - {edge_type}: {edge_index.size(1)} edges")
     
     # Time encoders
     graph = model.model.graph.graph
